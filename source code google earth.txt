@@ -1,0 +1,114 @@
+// Definisi wilayah (Wilayah Yogyakarta, termasuk Sleman, Gunungkidul, Kulon Progo, dan Bantul)
+var geometry = ee.Geometry.Polygon([
+  [
+    [110.2, -8.2],
+    [110.8, -8.2],
+    [110.8, -7.6],
+    [110.2, -7.6]
+  ]
+]);
+
+// Citra Elevasi untuk menghitung slope
+var dem = ee.Image('USGS/SRTMGL1_003');
+var slope = ee.Terrain.slope(dem).rename('Slope');
+
+// Data curah hujan CHIRPS (menghitung rata-rata curah hujan tahunan per lokasi)
+var rainfall = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate('2022-01-01', '2022-12-31')
+  .filterBounds(geometry)
+  .mean()
+  .multiply(365) // Total curah hujan tahunan (mm)
+  .rename('Rainfall');
+
+// Data vegetasi (NDVI) dari Sentinel-2
+var s2 = ee.ImageCollection('COPERNICUS/S2')
+  .filterDate('2022-01-01', '2022-12-31')
+  .filterBounds(geometry)
+  .map(function(image) {
+    var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    return image.addBands(ndvi);
+  })
+  .select('NDVI')
+  .median()
+  .clip(geometry)
+  .rename('Vegetation_Density');
+
+// Menggunakan dataset sungai HydroSHEDS
+var rivers = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers');
+var riversInYogyakarta = rivers.filterBounds(geometry);
+
+// Membuat citra raster sungai
+var riverRaster = riversInYogyakarta.map(function(feature) {
+  return feature.set('constant', 1); // Tambahkan atribut konstan
+}).reduceToImage({
+  properties: ['constant'],
+  reducer: ee.Reducer.first()
+}).unmask(0).clip(geometry); // Isi nilai null dengan 0
+
+var riverDistance = riverRaster.fastDistanceTransform().sqrt().rename('Distance_to_River');
+
+// Gabungkan semua parameter menjadi satu citra
+var landslideFactors = ee.Image.cat([slope, rainfall, s2, riverDistance])
+  .rename(['Slope', 'Rainfall', 'Vegetation_Density', 'Distance_to_River']);
+
+// Fungsi untuk menetapkan deskripsi lokasi berdasarkan koordinat
+function assignLocationDescription(feature) {
+  var coords = feature.geometry().coordinates();
+  var longitude = coords.get(0);
+  var latitude = coords.get(1);
+
+  // Tentukan kabupaten berdasarkan koordinat (contoh aturan sederhana)
+  var description = ee.Algorithms.If(
+    ee.Number(latitude).gte(-7.8).and(ee.Number(latitude).lte(-7.6)),
+    'Sleman, Yogyakarta',
+    ee.Algorithms.If(
+      ee.Number(latitude).gte(-8.0).and(ee.Number(latitude).lte(-7.8)),
+      'Gunungkidul, Yogyakarta',
+      ee.Algorithms.If(
+        ee.Number(longitude).lte(110.5),
+        'Kulon Progo, Yogyakarta',
+        'Bantul, Yogyakarta'
+      )
+    )
+  );
+
+  return feature.set('Location Description', description);
+}
+
+// Sampling daerah dengan risiko tinggi
+var samples = landslideFactors.sample({
+  region: geometry,
+  scale: 30,
+  numPixels: 50,
+  geometries: true
+});
+
+// Menambahkan kolom ID dan atribut tambahan
+samples = samples.map(function(feature) {
+  var coords = feature.geometry().coordinates();
+  return feature.set({
+    ID: ee.Number.parse(feature.id()).add(1), // Konversi ID ke Number sebelum menambahkannya
+    Longitude: coords.get(0),
+    Latitude: coords.get(1)
+  });
+}).map(assignLocationDescription);
+
+// Mendapatkan kolom sesuai format tabel
+samples = samples.select([
+  'ID', 'Latitude', 'Longitude', 'Location Description', 'Slope', 
+  'Rainfall', 'Vegetation_Density', 'Distance_to_River'
+]);
+
+// Menambahkan lapisan lokasi sampel
+Map.addLayer(samples, {color: 'black'}, 'Samples');
+
+// Mendapatkan URL unduhan untuk data CSV
+Export.table.toDrive({
+  collection: samples,
+  description: 'Formatted_Landslide_Data_Yogyakarta',
+  fileFormat: 'CSV',
+  selectors: [
+    'ID', 'Latitude', 'Longitude', 'Location Description', 'Slope', 
+    'Rainfall', 'Vegetation_Density', 'Distance_to_River'
+  ]
+});
